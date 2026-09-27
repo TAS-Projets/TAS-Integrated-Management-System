@@ -1,143 +1,123 @@
-name: Move issue to In Progress
+name: Move issue to In Progress (Project v2 - org)
 
 on:
   workflow_dispatch:
     inputs:
       issue_number:
-        description: Issue number to move
+        description: 'Issue number to move (in this repository)'
         required: true
         type: number
-      project_number:
-        description: GitHub Project Number (e.g. 12)
+      org_login:
+        description: 'Organization login that owns the Project'
         required: true
+        default: 'TAS-Projets'
+        type: string
+      project_number:
+        description: 'Project v2 number (from the URL, e.g. 2)'
+        required: true
+        default: 2
         type: number
       status_value:
-        description: Status value in the project field
+        description: 'Name of the single-select status value to set'
         required: true
-        default: In Progress
+        default: 'In progress'
         type: string
 
 permissions:
   contents: read
   issues: read
-  projects: write
+  # ACHTUNG: kein "projects:"-Eintrag hier — das führt zu "Unexpected value 'projects'"
 
 jobs:
   move_issue:
     runs-on: ubuntu-latest
     steps:
-      - name: Move issue to project status
+      - name: Move issue to project status (Project v2)
         uses: actions/github-script@v7
-        env:
-          ISSUE_NUMBER: ${{ github.event.inputs.issue_number }}
-          PROJECT_NUMBER: ${{ github.event.inputs.project_number }}
-          STATUS_VALUE: ${{ github.event.inputs.status_value }}
         with:
+          # Verwende hier das PAT-Secret (nicht GITHUB_TOKEN), weil org-Projekte oft nicht vom GITHUB_TOKEN abgedeckt werden.
+          #github-token: ${{ secrets.PROJECTS_TOKEN }}
           github-token: ${{ secrets.GITHUB_TOKEN }}
           script: |
+            const orgLogin = '${{ github.event.inputs.org_login }}';
+            const projectNumber = Number('${{ github.event.inputs.project_number }}');
+            const issueNumber = Number('${{ github.event.inputs.issue_number }}');
+            const statusValue = '${{ github.event.inputs.status_value }}';
             const owner = context.repo.owner;
             const repo = context.repo.repo;
-            const issueNumber = Number(process.env.ISSUE_NUMBER);
-            const projectNumber = Number(process.env.PROJECT_NUMBER);
-            const statusValue = process.env.STATUS_VALUE;
 
-            // 1) Get repository issue node id
-            const issue = await github.graphql(`
-              query($owner: String!, $repo: String!, $issueNumber: Int!) {
-                repository(owner: $owner, name: $repo) {
-                  issue(number: $issueNumber) {
-                    id
-                    title
-                  }
+            // Hole Issue Node-ID
+            const issueResp = await github.graphql(
+              `query($owner:String!, $repo:String!, $issueNumber:Int!) {
+                repository(owner:$owner, name:$repo) {
+                  issue(number:$issueNumber) { id title url }
                 }
-              }
-            `, {
-              owner,
-              repo,
-              issueNumber
-            });
+              }`,
+              { owner, repo, issueNumber }
+            );
+            if (!issueResp.repository || !issueResp.repository.issue) {
+              throw new Error(`Issue #${issueNumber} nicht gefunden in ${owner}/${repo}`);
+            }
+            const issueId = issueResp.repository.issue.id;
 
-            const issueId = issue.repository.issue.id;
-
-            // 2) Get project v2 ID and fields
-            const projectData = await github.graphql(`
-              query($owner: String!, $repo: String!, $projectNumber: Int!) {
-                repository(owner: $owner, name: $repo) {
-                  projectV2(number: $projectNumber) {
+            // Hole org Project v2
+            const projectResp = await github.graphql(
+              `query($orgLogin:String!, $projectNumber:Int!) {
+                organization(login:$orgLogin) {
+                  projectV2(number:$projectNumber) {
                     id
                     title
-                    fields(first: 50) {
+                    fields(first:50) {
                       nodes {
                         ... on ProjectV2SingleSelectField {
                           id
                           name
-                          options {
-                            id
-                            name
-                          }
+                          options { id name }
                         }
                       }
                     }
-                    items(first: 200) {
-                      nodes {
-                        id
-                        content {
-                          ... on Issue {
-                            id
-                          }
-                        }
-                      }
+                    items(first:200) {
+                      nodes { id content { ... on Issue { id } } }
                     }
                   }
                 }
-              }
-            `, {
-              owner,
-              repo,
-              projectNumber
-            });
+              }`,
+              { orgLogin, projectNumber }
+            );
 
-            const project = projectData.repository.projectV2;
-            if (!project) {
-              throw new Error(`Project #${projectNumber} not found in repo ${owner}/${repo}`);
+            const project = projectResp.organization && projectResp.organization.projectV2;
+            if (!project) throw new Error(`Project #${projectNumber} in org ${orgLogin} nicht gefunden`);
+
+            // Finde Feld/Option
+            const fields = project.fields.nodes || [];
+            let targetField = null;
+            let targetOption = null;
+            for (const f of fields) {
+              if (!f || !f.options) continue;
+              const opt = f.options.find(o => o.name.toLowerCase() === statusValue.toLowerCase());
+              if (opt) { targetField = f; targetOption = opt; break; }
+            }
+            if (!targetField) {
+              const available = fields.flatMap(f => (f && f.options) ? f.options.map(o => o.name) : []);
+              throw new Error(`Keine passende Option "${statusValue}" gefunden. Verfügbare: ${[...new Set(available)].join(', ')}`);
             }
 
-            const field = project.fields.nodes.find(f => f.name === 'Status' || f.name === 'Status/Progress' || f.name === 'Project Status');
-            if (!field) {
-              throw new Error(`No Status field found in project "${project.title}". Add a single-select field named "Status".`);
-            }
+            // Finde Item (Issue) im Project
+            const items = project.items.nodes || [];
+            const item = items.find(n => n.content && n.content.id === issueId);
+            if (!item) throw new Error(`Issue #${issueNumber} ist nicht im Project #${projectNumber} (ggf. Pagination nötig)`);
 
-            const option = field.options.find(o => o.name === statusValue);
-            if (!option) {
-              throw new Error(`Status option "${statusValue}" not found in the project field. Available options: ${field.options.map(o => o.name).join(', ')}`);
-            }
+            // Update Feld
+            await github.graphql(
+              `mutation($projectId:ID!, $itemId:ID!, $fieldId:ID!, $optionId:String!) {
+                updateProjectV2ItemFieldValue(input:{
+                  projectId:$projectId,
+                  itemId:$itemId,
+                  fieldId:$fieldId,
+                  value:{ singleSelectOptionId:$optionId }
+                }) { projectV2Item { id } }
+              }`,
+              { projectId: project.id, itemId: item.id, fieldId: targetField.id, optionId: targetOption.id }
+            );
 
-            const item = project.items.nodes.find(node => node.content && node.content.id === issueId);
-            if (!item) {
-              throw new Error(`Issue #${issueNumber} is not in project #${projectNumber}`);
-            }
-
-            // 3) Update the single-select field value
-            await github.graphql(`
-              mutation($projectId: ID!, $itemId: ID!, $fieldId: ID!, $optionId: String!) {
-                updateProjectV2ItemFieldValue(
-                  input: {
-                    projectId: $projectId,
-                    itemId: $itemId,
-                    fieldId: $fieldId,
-                    value: { singleSelectOptionId: $optionId }
-                  }
-                ) {
-                  projectV2Item {
-                    id
-                  }
-                }
-              }
-            `, {
-              projectId: project.id,
-              itemId: item.id,
-              fieldId: field.id,
-              optionId: option.id
-            });
-
-            console.log(`Issue #${issueNumber} moved to "${statusValue}" in project #${projectNumber}`);
+            console.log(`Issue #${issueNumber} -> "${statusValue}" in Projekt "${project.title}".`);
